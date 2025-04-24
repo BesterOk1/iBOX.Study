@@ -1,0 +1,35 @@
+model User {
+  id        String     @id @default(cuid())
+  email     String?    @unique
+  name      String?
+  image     String?
+  handle    String?
+  isAdmin   Boolean    @default(false)
+  createdAt DateTime   @default(now())
+  progress  Progress[]
+}
+
+model Course {
+  id          String     @id @default(cuid())
+  title       String
+  description String
+  pdfUrl      String
+  videoUrl    String?
+  createdAt   DateTime   @default(now())
+  updatedAt   DateTime   @updatedAt
+  progress    Progress[]
+}
+
+model Progress {
+  id          String    @id @default(cuid())
+  userId      String
+  courseId    String
+  completed   Boolean   @default(false)
+  completedAt DateTime?
+  user        User      @relation(fields: [userId], references: [id])
+  course      Course    @relation(fields: [courseId], references: [id])
+  createdAt   DateTime  @default(now())
+  updatedAt   DateTime  @updatedAt
+
+  @@unique([userId, courseId])
+}
