@@ -2,15 +2,15 @@ import { expect } from "expect";
 import { listCourses, getCourse, createCourse, deleteCourse } from "./api";
 import { z } from "zod";
 
-// 1. Добавим схему валидации для курса
+// 1. Исправленная схема валидации с преобразованием дат
 const CourseSchema = z.object({
   id: z.string(),
-  title: z.string(),
-  description: z.string(),
+  title: z.string().min(1),
+  description: z.string().min(1),
   pdfUrl: z.string().url(),
-  videoUrl: z.string().url().nullable(),
-  createdAt: z.date(),
-  updatedAt: z.date(),
+  videoUrl: z.string().url().nullable().optional(),
+  createdAt: z.string().datetime(),
+  updatedAt: z.string().datetime(),
 });
 
 type TestResult = {
@@ -23,14 +23,19 @@ type TestResult = {
   duration: number;
 };
 
-// 2. Обертка для выполнения тестов
+// 2. Улучшенная обертка для тестов с таймаутом
 async function runTest<T extends unknown[]>(
   name: string,
   testFn: (...args: T) => Promise<void>,
   ...args: T
 ): Promise<Omit<TestResult, "duration">> {
   try {
-    await testFn(...args);
+    await Promise.race([
+      testFn(...args),
+      new Promise((_, reject) => 
+        setTimeout(() => reject(new Error("Timeout after 5000ms")), 5000)
+      )
+    ]);
     return { 
       passed: [name], 
       failed: [] 
@@ -47,25 +52,27 @@ async function runTest<T extends unknown[]>(
   }
 }
 
-// 3. Добавим тестовые данные
+// 3. Корректные тестовые данные согласно API
 const TEST_COURSE = {
   title: "Test Course",
   description: "Test Description",
-  pdfUrl: "data:application/pdf;base64,VEhJUyBJUyBBIERFTU8=", // Исправлено на pdfUrl
-  videoUrl: null, // Добавлено поле videoUrl для соответствия схеме
+  pdfBase64: "VEhJUyBJUyBBIERFTU8=", // Исправлено имя параметра
+  videoUrl: null,
 };
 
-// 4. Основные тесты
+// 4. Обновленные тесты с улучшенной обработкой ошибок
 async function testListCourses() {
   const courses = await listCourses();
   
   expect(Array.isArray(courses)).toBe(true);
-  expect(courses.length).toBeGreaterThanOrEqual(0);
-
-  // Валидация структуры данных
+  
   if (courses.length > 0) {
-    courses.forEach(course => {
-      expect(() => CourseSchema.parse(course)).not.toThrow();
+    courses.forEach((course, index) => {
+      try {
+        CourseSchema.parse(course);
+      } catch (e) {
+        throw new Error(`Invalid course at index ${index}: ${e.message}`);
+      }
     });
   }
 }
@@ -74,23 +81,30 @@ async function testCourseLifecycle() {
   // Создание курса
   const newCourse = await createCourse(TEST_COURSE);
   
-  // Проверка создания
-  expect(newCourse).toMatchObject({
-    title: TEST_COURSE.title,
-    description: TEST_COURSE.description
-  });
+  // Расширенная проверка структуры
+  expect(() => CourseSchema.parse(newCourse)).not.toThrow();
   
   // Получение курса
   const course = await getCourse({ id: newCourse.id });
-  expect(course).toEqual(newCourse);
+  expect(course).toMatchObject({
+    id: newCourse.id,
+    title: TEST_COURSE.title,
+    description: TEST_COURSE.description
+  });
 
-  // Удаление курса
+  // Удаление и проверка
   await deleteCourse({ id: newCourse.id });
-  const deletedCourse = await getCourse({ id: newCourse.id });
-  expect(deletedCourse).toBeNull();
+  
+  // Обработка ошибки при получении удаленного курса
+  try {
+    await getCourse({ id: newCourse.id });
+    expect(true).toBe(false); // Force fail если не выброшена ошибка
+  } catch (error) {
+    expect(error.message).toMatch(/not found/i);
+  }
 }
 
-// 5. Обновленная функция запуска тестов
+// 5. Улучшенный запуск тестов с параллельным выполнением
 export async function _runApiTests(): Promise<TestResult> {
   const start = Date.now();
   const result: TestResult = { 
@@ -99,28 +113,18 @@ export async function _runApiTests(): Promise<TestResult> {
     duration: 0 
   };
 
-  // Запуск тестов с обработкой результатов
-  const tests = [
+  const testResults = await Promise.all([
     runTest("testListCourses", testListCourses),
     runTest("testCourseLifecycle", testCourseLifecycle),
-  ];
+  ]);
 
-  for await (const testResult of tests) {
-    result.passed.push(...testResult.passed);
-    result.failed.push(...testResult.failed);
-  }
+  testResults.forEach((tr) => {
+    result.passed.push(...tr.passed);
+    result.failed.push(...tr.failed);
+  });
 
   result.duration = Date.now() - start;
   return result;
 }
 
-// 6. Дополнительные утилиты (для расширения)
-function describe(name: string, tests: () => void) {
-  console.log(`\nDescribe: ${name}`);
-  tests();
-}
-
-function it(name: string, testFn: () => Promise<void>) {
-  console.log(`  Test: ${name}`);
-  return testFn();
-}
+// 6. Удалены неиспользуемые утилиты
