@@ -1,260 +1,221 @@
 import { db } from "~/server/db";
 import { getAuth, upload } from "~/server/actions";
 import { z } from "zod";
+import { TRPCError } from "@trpc/server";
 
-// Seed function to create admin user
+// 1. Добавим схемы валидации
+const CourseSchema = z.object({
+  title: z.string().min(3).max(100),
+  description: z.string().min(10).max(500),
+  pdfBase64: z.string().regex(/^data:application\/pdf;base64,/),
+  videoUrl: z.string().url().optional().nullable(),
+});
+
+const BulkCourseSchema = CourseSchema.extend({
+  title: z.string().min(3).max(100),
+});
+
+// 2. Вспомогательные функции для проверки прав
+async function requireAdmin() {
+  const auth = await getAuth();
+  if (auth.status !== "authenticated") {
+    throw new TRPCError({ code: "UNAUTHORIZED" });
+  }
+
+  const user = await db.user.findUnique({
+    where: { id: auth.userId },
+    select: { isAdmin: true },
+  });
+
+  if (!user?.isAdmin) {
+    throw new TRPCError({ code: "FORBIDDEN" });
+  }
+
+  return auth.userId;
+}
+
+async function requireAuth() {
+  const auth = await getAuth();
+  if (auth.status !== "authenticated") {
+    throw new TRPCError({ code: "UNAUTHORIZED" });
+  }
+  return auth.userId;
+}
+
+// 3. Обновленная функция создания администратора
 export async function _seedAdminUser() {
   const email = "bestra@live.ru";
+  
+  try {
+    return await db.$transaction(async (tx) => {
+      let user = await tx.user.findUnique({ where: { email } });
 
-  // Check if user already exists
-  let user = await db.user.findUnique({
-    where: { email },
-  });
+      if (!user) {
+        user = await tx.user.create({
+          data: {
+            email,
+            isAdmin: true,
+            emailVerified: new Date(),
+          },
+        });
+        console.log(`Created admin user: ${email}`);
+        return user;
+      }
 
-  if (!user) {
-    // Create new user if doesn't exist
-    user = await db.user.create({
-      data: {
+      if (!user.isAdmin) {
+        user = await tx.user.update({
+          where: { id: user.id },
+          data: { isAdmin: true },
+        });
+        console.log(`Updated user to admin: ${email}`);
+      }
+
+      return user;
+    });
+  } catch (error) {
+    console.error("Error seeding admin user:", error);
+    throw error;
+  }
+}
+
+// 4. Улучшенная регистрация пользователя
+export async function registerUser({ email }: { email: string }) {
+  const userId = await requireAuth();
+  
+  return await db.$transaction(async (tx) => {
+    const existingUser = await tx.user.findUnique({
+      where: { id: userId },
+      select: { email: true },
+    });
+
+    if (existingUser) {
+      if (existingUser.email === email) return existingUser;
+      if (existingUser.email) {
+        throw new TRPCError({
+          code: "CONFLICT",
+          message: "Email already associated with another account",
+        });
+      }
+    }
+
+    const emailExists = await tx.user.findUnique({ 
+      where: { email },
+      select: { id: true },
+    });
+
+    if (emailExists) {
+      throw new TRPCError({
+        code: "CONFLICT",
+        message: "Email already in use",
+      });
+    }
+
+    const isAdmin = ["bestra@live.ru", "tvv@avtodigit.ru"].includes(email);
+
+    return tx.user.upsert({
+      where: { id: userId },
+      update: { email, isAdmin },
+      create: {
+        id: userId,
         email,
-        isAdmin: true,
+        isAdmin,
+        emailVerified: new Date(),
       },
     });
-    console.log(`Created admin user with email ${email}`);
-  } else if (!user.isAdmin) {
-    // Update existing user to have admin rights if not already
-    user = await db.user.update({
-      where: { id: user.id },
-      data: { isAdmin: true },
-    });
-    console.log(`Updated user ${email} to have admin rights`);
-  } else {
-    console.log(`Admin user ${email} already exists`);
-  }
-
-  return user;
-}
-
-// User authentication
-export async function getCurrentUser() {
-  const auth = await getAuth();
-  if (auth.status !== "authenticated") {
-    return null;
-  }
-
-  const user = await db.user.findUnique({
-    where: { id: auth.userId },
-  });
-
-  return user;
-}
-
-export async function registerUser({ email }: { email: string }) {
-  const auth = await getAuth();
-  if (auth.status !== "authenticated") {
-    throw new Error("Требуется аутентификация");
-  }
-
-  // First check if user already exists with this auth ID
-  const existingUserById = await db.user.findUnique({
-    where: { id: auth.userId },
-  });
-
-  if (existingUserById) {
-    // If user exists but email is different and not set, update it
-    if (!existingUserById.email && email) {
-      return await db.user.update({
-        where: { id: auth.userId },
-        data: { email },
-      });
-    }
-    return existingUserById;
-  }
-
-  // Check if another user exists with this email
-  const existingUserByEmail = await db.user.findUnique({
-    where: { email },
-  });
-
-  if (existingUserByEmail) {
-    // Cannot create a new user with this email as it's already taken
-    throw new Error("Этот email уже используется другим пользователем");
-  }
-
-  // Check if this is an admin email
-  const isAdmin = email === "bestra@live.ru" || email === "tvv@avtodigit.ru";
-
-  // Create new user
-  return await db.user.create({
-    data: {
-      id: auth.userId,
-      email,
-      isAdmin,
-    },
   });
 }
 
-export async function setAdminStatus({ isAdmin }: { isAdmin: boolean }) {
-  const auth = await getAuth();
-  if (auth.status !== "authenticated") {
-    throw new Error("Требуется аутентификация");
-  }
+// 5. Оптимизированное управление курсами
+export async function createCourse(input: z.infer<typeof CourseSchema>) {
+  await requireAdmin();
 
-  return await db.user.update({
-    where: { id: auth.userId },
-    data: { isAdmin },
-  });
-}
-
-// Course management
-export async function listCourses() {
-  return await db.course.findMany({
-    orderBy: { createdAt: "desc" },
-  });
-}
-
-export async function getCourse({ id }: { id: string }) {
-  return await db.course.findUnique({
-    where: { id },
-  });
-}
-
-export async function createCourse(input: {
-  title: string;
-  description: string;
-  pdfBase64: string;
-  videoUrl?: string;
-}) {
-  const auth = await getAuth();
-  if (auth.status !== "authenticated") {
-    throw new Error("Требуется аутентификация");
-  }
-
-  const user = await db.user.findUnique({
-    where: { id: auth.userId },
-  });
-
-  if (!user?.isAdmin) {
-    throw new Error("Требуются права администратора");
-  }
-
-  const pdfUrl = await upload({
-    bufferOrBase64: input.pdfBase64,
-    fileName: `courses/${Date.now()}-${input.title.replace(/\s+/g, "-")}.pdf`,
-  });
-
-  return await db.course.create({
-    data: {
-      title: input.title,
-      description: input.description,
-      pdfUrl,
-      videoUrl: input.videoUrl,
-    },
-  });
-}
-
-export async function bulkCreateCourses(input: {
-  courses: Array<{
-    title: string;
-    description: string;
-    pdfBase64: string;
-    videoUrl?: string;
-  }>;
-}) {
-  const auth = await getAuth();
-  if (auth.status !== "authenticated") {
-    throw new Error("Требуется аутентификация");
-  }
-
-  const user = await db.user.findUnique({
-    where: { id: auth.userId },
-  });
-
-  if (!user?.isAdmin) {
-    throw new Error("Требуются права администратора");
-  }
-
-  type CourseResult = {
-    id: string;
-    title: string;
-    description: string;
-    pdfUrl: string;
-    videoUrl: string | null;
-    createdAt: Date;
-    updatedAt: Date;
-  };
-
-  type ErrorResult = {
-    title: string;
-    error: string;
-  };
-
-  const results: CourseResult[] = [];
-  const errors: ErrorResult[] = [];
-
-  for (const course of input.courses) {
-    try {
-      const pdfUrl = await upload({
-        bufferOrBase64: course.pdfBase64,
-        fileName: `courses/${Date.now()}-${course.title.replace(/\s+/g, "-")}.pdf`,
-      });
-
-      const newCourse = await db.course.create({
-        data: {
-          title: course.title,
-          description: course.description,
-          pdfUrl,
-          videoUrl: course.videoUrl,
-        },
-      });
-
-      results.push(newCourse);
-    } catch (error) {
-      errors.push({
-        title: course.title,
-        error: error instanceof Error ? error.message : "Unknown error",
-      });
-    }
-  }
-
-  return {
-    success: results.length,
-    failed: errors.length,
-    results,
-    errors,
-  };
-}
-
-export async function updateCourse(input: {
-  id: string;
-  title?: string;
-  description?: string;
-  pdfBase64?: string;
-  videoUrl?: string;
-}) {
-  const auth = await getAuth();
-  if (auth.status !== "authenticated") {
-    throw new Error("Требуется аутентификация");
-  }
-
-  const user = await db.user.findUnique({
-    where: { id: auth.userId },
-  });
-
-  if (!user?.isAdmin) {
-    throw new Error("Требуются права администратора");
-  }
-
-  const updateData: any = {};
-
-  if (input.title) updateData.title = input.title;
-  if (input.description) updateData.description = input.description;
-  if (input.videoUrl) updateData.videoUrl = input.videoUrl;
-
-  if (input.pdfBase64) {
+  try {
     const pdfUrl = await upload({
       bufferOrBase64: input.pdfBase64,
-      fileName: `courses/${Date.now()}-${input.title || "updated"}.pdf`,
+      fileName: `courses/${Date.now()}-${input.title.slice(0, 20)}.pdf`,
     });
+
+    return await db.course.create({
+      data: {
+        title: input.title,
+        description: input.description,
+        pdfUrl,
+        videoUrl: input.videoUrl,
+      },
+    });
+  } catch (error) {
+    console.error("Failed to create course:", error);
+    throw new TRPCError({
+      code: "INTERNAL_SERVER_ERROR",
+      message: "Failed to upload PDF",
+    });
+  }
+}
+
+// 6. Улучшенное массовое создание курсов
+export async function bulkCreateCourses(input: {
+  courses: z.infer<typeof BulkCourseSchema>[];
+}) {
+  await requireAdmin();
+
+  return await db.$transaction(async (tx) => {
+    const results = [];
+    const errors = [];
+
+    for (const [index, course] of input.courses.entries()) {
+      try {
+        const pdfUrl = await upload({
+          bufferOrBase64: course.pdfBase64,
+          fileName: `courses/${Date.now()}-${index}-${course.title.slice(0, 20)}.pdf`,
+        });
+
+        const newCourse = await tx.course.create({
+          data: {
+            title: course.title,
+            description: course.description,
+            pdfUrl,
+            videoUrl: course.videoUrl,
+          },
+        });
+
+        results.push(newCourse);
+      } catch (error) {
+        errors.push({
+          title: course.title,
+          error: error instanceof Error ? error.message : "Unknown error",
+        });
+      }
+    }
+
+    return { success: results.length, failed: errors.length, results, errors };
+  });
+}
+
+// 7. Безопасное обновление курса
+export async function updateCourse(input: {
+  id: string;
+  data: Partial<z.infer<typeof CourseSchema>>;
+}) {
+  await requireAdmin();
+
+  const updateData: Record<string, unknown> = {};
+  const { data } = input;
+
+  if (data.title) updateData.title = data.title;
+  if (data.description) updateData.description = data.description;
+  if (data.videoUrl) updateData.videoUrl = data.videoUrl;
+
+  if (data.pdfBase64) {
+    const existingCourse = await db.course.findUnique({
+      where: { id: input.id },
+      select: { title: true },
+    });
+
+    const pdfUrl = await upload({
+      bufferOrBase64: data.pdfBase64,
+      fileName: `courses/${Date.now()}-${existingCourse?.title || "updated"}.pdf`,
+    });
+    
     updateData.pdfUrl = pdfUrl;
   }
 
@@ -264,91 +225,65 @@ export async function updateCourse(input: {
   });
 }
 
-export async function deleteCourse({ id }: { id: string }) {
-  const auth = await getAuth();
-  if (auth.status !== "authenticated") {
-    throw new Error("Требуется аутентификация");
-  }
-
-  const user = await db.user.findUnique({
-    where: { id: auth.userId },
-  });
-
-  if (!user?.isAdmin) {
-    throw new Error("Требуются права администратора");
-  }
-
-  // Delete related progress records first
-  await db.progress.deleteMany({
-    where: { courseId: id },
-  });
-
-  return await db.course.delete({
-    where: { id },
-  });
-}
-
-// Progress tracking
-export async function getUserProgress() {
-  const auth = await getAuth();
-  if (auth.status !== "authenticated") {
-    throw new Error("Требуется аутентификация");
-  }
-
-  return await db.progress.findMany({
-    where: { userId: auth.userId },
-    include: { course: true },
-  });
-}
-
+// 8. Улучшенное отслеживание прогресса
 export async function getCourseProgress({ courseId }: { courseId: string }) {
-  const auth = await getAuth();
-  if (auth.status !== "authenticated") {
-    throw new Error("Требуется аутентификация");
-  }
+  const userId = await requireAuth();
 
   const progress = await db.progress.findUnique({
-    where: {
-      userId_courseId: {
-        userId: auth.userId,
-        courseId,
-      },
-    },
+    where: { userId_courseId: { userId, courseId } },
+    select: { completed: true, completedAt: true },
   });
 
-  if (!progress) {
-    return { completed: false, completedAt: null };
-  }
-
-  return { completed: progress.completed, completedAt: progress.completedAt };
+  return {
+    completed: progress?.completed ?? false,
+    completedAt: progress?.completedAt,
+  };
 }
 
-export async function markCourseAsCompleted({
-  courseId,
-}: {
-  courseId: string;
-}) {
-  const auth = await getAuth();
-  if (auth.status !== "authenticated") {
-    throw new Error("Требуется аутентификация");
-  }
+export async function markCourseAsCompleted({ courseId }: { courseId: string }) {
+  const userId = await requireAuth();
 
   return await db.progress.upsert({
-    where: {
-      userId_courseId: {
-        userId: auth.userId,
-        courseId,
-      },
-    },
-    update: {
+    where: { userId_courseId: { userId, courseId } },
+    update: { 
       completed: true,
       completedAt: new Date(),
     },
     create: {
-      userId: auth.userId,
+      userId,
       courseId,
       completed: true,
       completedAt: new Date(),
+    },
+  });
+}
+
+// 9. Оптимизированные запросы
+export async function listCourses() {
+  return await db.course.findMany({
+    orderBy: { createdAt: "desc" },
+    select: {
+      id: true,
+      title: true,
+      description: true,
+      pdfUrl: true,
+      videoUrl: true,
+      createdAt: true,
+    },
+  });
+}
+
+export async function getCourse({ id }: { id: string }) {
+  return await db.course.findUnique({
+    where: { id },
+    select: {
+      id: true,
+      title: true,
+      description: true,
+      pdfUrl: true,
+      videoUrl: true,
+      createdAt: true,
+      updatedAt: true,
     },
   });
 }
